@@ -1,4 +1,6 @@
 mod app;
+mod audio;
+mod viz;
 
 use eframe::NativeOptions;
 
@@ -7,6 +9,8 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Music Visualizer - MinSu Lab",
         options,
-        Box::new(|_cc| Ok(Box::new(app::VisualizerApp::new()))),
+        Box::new(|_cc| {
+            Box::new(app::VisualizerApp::new()) as Box<dyn eframe::App>
+        }),
     )
 }

@@ -47,7 +47,6 @@ impl eframe::App for VisualizerApp {
             if let Some(samples) = &*data_lock {
                 renderer::draw_waveform(ui, samples, self.playhead);
                 
-                // Simulate playback movement
                 if self.is_playing && !samples.is_empty() {
                     self.playhead = (self.playhead + 512) % samples.len();
                 }
