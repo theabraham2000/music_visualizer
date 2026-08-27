@@ -1,4 +1,4 @@
-use rodio::{Decoder, Sink, OutputStream}; // Removed Source
+use rodio::{Decoder, Sink, OutputStream};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -67,6 +67,18 @@ impl AudioEngine {
         self.sink = None;
         self._stream = None;
         self.is_playing = false;
+    }
+
+    /// Call this every frame to detect if track ended naturally
+    pub fn check_finished(&mut self) {
+        if self.is_playing {
+            if let Some(sink) = &self.sink {
+                // If sink is empty, the track has finished
+                if sink.empty() {
+                    self.stop();
+                }
+            }
+        }
     }
 
     pub fn is_playing(&self) -> bool {

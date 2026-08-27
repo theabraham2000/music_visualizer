@@ -13,14 +13,14 @@ pub struct VisualizerApp {
     audio_engine: AudioEngine,
     fft_processor: FftProcessor,
     spectrum: Vec<f32>,
-    smoothed_spectrum: Vec<f32>, // For visual smoothing
+    smoothed_spectrum: Vec<f32>,
     playhead: usize,
     current_track: String,
 }
 
 impl VisualizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark()); // Force dark mode
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         
         Self {
             samples: Arc::new(Mutex::new(None)),
@@ -59,7 +59,9 @@ impl VisualizerApp {
 
 impl eframe::App for VisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // TOP BAR
+        // CRITICAL: Check if track ended naturally every frame
+        self.audio_engine.check_finished();
+        
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("🎛️ MinSu Audio Station").color(styles::TEXT_PRIMARY));
@@ -72,7 +74,6 @@ impl eframe::App for VisualizerApp {
             });
         });
         
-        // STATUS BAR
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let status_color = if self.audio_engine.is_playing() { 
@@ -87,12 +88,11 @@ impl eframe::App for VisualizerApp {
                     .color(styles::TEXT_SECONDARY)
                     .size(12.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("v0.3.0-pro").color(styles::TEXT_SECONDARY).size(12.0));
+                    ui.label(egui::RichText::new("v0.3.1-stable").color(styles::TEXT_SECONDARY).size(12.0));
                 });
             });
         });
         
-        // CENTRAL PANEL
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().visuals.widgets.inactive.bg_fill = styles::BG_PRIMARY;
             ui.style_mut().visuals.widgets.inactive.weak_bg_fill = styles::BG_PRIMARY;
@@ -100,7 +100,6 @@ impl eframe::App for VisualizerApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
                 
-                // CONTROLS
                 ui.horizontal(|ui| {
                     ui.visuals_mut().button_frame = true;
                     
@@ -113,19 +112,21 @@ impl eframe::App for VisualizerApp {
                     let has_track = self.audio_engine.has_track();
                     let is_playing = self.audio_engine.is_playing();
                     
-                    // Play/Pause Button
-                    let btn_text = if is_playing { " Pause" } else { "▶ Play" };
+                    let btn_text = if is_playing { "⏸ Pause" } else { "▶ Play" };
                     if ui.add_enabled(has_track, egui::Button::new(btn_text)).clicked() && has_track {
                         if let Err(e) = self.audio_engine.toggle_play_pause() {
                             eprintln!("Control Error: {}", e);
                         }
+                        // HARD RESET visuals on state change
+                        if !self.audio_engine.is_playing() {
+                            self.smoothed_spectrum.fill(0.0);
+                        }
                     }
                     
-                    // Stop Button
                     if ui.add_enabled(has_track, egui::Button::new("⏹ Stop")).clicked() && has_track {
                         self.audio_engine.stop();
                         self.playhead = 0;
-                        self.smoothed_spectrum.fill(0.0); // Clear visuals immediately
+                        self.smoothed_spectrum.fill(0.0); // INSTANT CLEAR
                     }
                     
                     ui.add_space(15.0);
@@ -143,30 +144,38 @@ impl eframe::App for VisualizerApp {
                 
                 ui.add_space(25.0);
                 
-                // VISUALIZATION
                 let data_lock = self.samples.lock().unwrap();
                 if let Some(samples) = &*data_lock {
-                    // SYNC LOGIC
-                    if self.audio_engine.is_playing() {
+                    let is_playing = self.audio_engine.is_playing();
+                    
+                    // ONLY advance playhead if actively playing
+                    if is_playing {
                         self.playhead = (self.playhead + SAMPLES_PER_FRAME) % samples.len();
                     }
                     
-                    // PROCESS FFT
-                    if samples.len() >= FFT_SIZE && (self.audio_engine.is_playing() || !self.smoothed_spectrum.iter().all(|&x| x == 0.0)) {
+                    // PROCESS FFT only if playing OR if we have residual energy to clear
+                    let has_energy = self.smoothed_spectrum.iter().any(|&x| x > 0.001);
+                    
+                    if samples.len() >= FFT_SIZE && (is_playing || has_energy) {
                         let safe_start = self.playhead.min(samples.len() - FFT_SIZE);
                         let raw_spectrum = self.fft_processor.process(&samples[safe_start..safe_start + FFT_SIZE]);
                         
-                        // SMOOTHING (Exponential Moving Average)
-                        for i in 0..self.smoothed_spectrum.len() {
-                            let target = raw_spectrum[i];
-                            // 0.3 = fast response, 0.1 = slow/smooth
-                            self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.4;
+                        if is_playing {
+                            // Normal smoothing during playback
+                            for i in 0..self.smoothed_spectrum.len() {
+                                let target = raw_spectrum[i];
+                                self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.4;
+                            }
+                        } else {
+                            // HARD DECAY to zero when stopped/paused (fast fade out)
+                            for val in self.smoothed_spectrum.iter_mut() {
+                                *val *= 0.5; // Fast decay
+                                if *val < 0.001 { *val = 0.0; } // Snap to zero
+                            }
                         }
-                    } else if !self.audio_engine.is_playing() && self.audio_engine.has_track() {
-                         // Optional: Decay spectrum when paused/stopped for cool effect
-                         for val in self.smoothed_spectrum.iter_mut() {
-                             *val *= 0.9;
-                         }
+                    } else if !is_playing && !has_energy {
+                        // Ensure completely zero when idle
+                        self.smoothed_spectrum.fill(0.0);
                     }
                     
                     renderer::draw_visualizer(ui, samples, &self.smoothed_spectrum, self.playhead);
@@ -179,7 +188,11 @@ impl eframe::App for VisualizerApp {
             });
         });
         
-        if self.audio_engine.is_playing() || self.smoothed_spectrum.iter().any(|&x| x > 0.01) {
+        // ONLY request repaint if playing OR if there's visual energy to clear
+        let needs_repaint = self.audio_engine.is_playing() 
+            || self.smoothed_spectrum.iter().any(|&x| x > 0.001);
+            
+        if needs_repaint {
             ctx.request_repaint();
         }
     }
