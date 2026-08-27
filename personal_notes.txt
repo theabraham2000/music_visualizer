@@ -1,0 +1,7 @@
+issues/suggestion:
+- show the name of file
+- show start, pause, stop button
+- once music stop playing, visualization should not play again unless audio is made to play again
+- visualization and audio should be matching. now it seems audio and visualization may not be aligned but randomly playing. (please verify this, because we cannot cheat the user)
+- on minimizing the frequency part get cut out as shown in the image
+- magnitude of the frequency part should be have more magnitude for visualization

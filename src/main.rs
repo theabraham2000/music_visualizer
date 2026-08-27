@@ -7,10 +7,10 @@ use eframe::NativeOptions;
 fn main() -> Result<(), eframe::Error> {
     let options = NativeOptions::default();
     eframe::run_native(
-        "Music Visualizer - MinSu Lab",
+        "MinSu Audio Station",
         options,
-        Box::new(|_cc| {
-            Box::new(app::VisualizerApp::new()) as Box<dyn eframe::App>
+        Box::new(|cc| {
+            Box::new(app::VisualizerApp::new(cc)) as Box<dyn eframe::App>
         }),
     )
 }
