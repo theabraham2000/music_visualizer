@@ -1,0 +1,11 @@
+[package]
+name = "music_visualizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+rodio = { version = "0.17", features = ["mp3"] }
+rustfft = "6.2"
+num-complex = "0.4"
+rfd = "0.14"
