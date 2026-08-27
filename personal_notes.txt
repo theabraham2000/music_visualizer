@@ -1,7 +1,6 @@
 issues/suggestion:
-- show the name of file
-- show start, pause, stop button
-- once music stop playing, visualization should not play again unless audio is made to play again
-- visualization and audio should be matching. now it seems audio and visualization may not be aligned but randomly playing. (please verify this, because we cannot cheat the user)
-- on minimizing the frequency part get cut out as shown in the image
-- magnitude of the frequency part should be have more magnitude for visualization
+- pause button not working
+- even after music stops, visualization is still continuing, which make me suspect it is not correctly parsing music to visualization
+- logos on the top left is not correctly coming.
+- after clicking stop there is no way to play again other than re selecting the music from the folders, fix it.
+- make the ui little more attractive and professional for software design, now it simply look like matplotlib graphs
