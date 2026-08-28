@@ -205,7 +205,9 @@ impl eframe::App for VisualizerApp {
                 let playhead = self.audio_engine.position_samples(sample_rate);
 
                 // --- Analysis driven by engine clock ---
-                let (left, right) = Self::get_stereo_window(data, playhead, FFT_SIZE);
+                // Use larger window for phase meter visibility
+                let phase_window = 2048;
+                let (left, right) = Self::get_stereo_window(data, playhead, phase_window);
 
                 // Use left channel for FFT (or mix: could average L+R)
                 let mono_mix: Vec<f32> = left.iter().zip(right.iter())
@@ -290,6 +292,7 @@ impl eframe::App for VisualizerApp {
                     self.peak_hold,
                     self.radial_rotation,
                     bass_norm_for_pulse(&self.smoothed_spectrum, sample_rate),
+                    sample_rate,  // <-- NEW: pass sample rate for correct freq mapping
                 );
             } else {
                 ui.vertical_centered_justified(|ui| {
