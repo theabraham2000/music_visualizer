@@ -12,7 +12,7 @@ pub struct VisualizerApp {
     samples: Arc<Mutex<Option<Vec<f32>>>>,
     audio_engine: AudioEngine,
     fft_processor: FftProcessor,
-    spectrum: Vec<f32>,
+    // REMOVED: spectrum field (was never read)
     smoothed_spectrum: Vec<f32>,
     playhead: usize,
     current_track: String,
@@ -26,7 +26,6 @@ impl VisualizerApp {
             samples: Arc::new(Mutex::new(None)),
             audio_engine: AudioEngine::new(),
             fft_processor: FftProcessor::new(FFT_SIZE),
-            spectrum: vec![0.0; FFT_SIZE / 2],
             smoothed_spectrum: vec![0.0; FFT_SIZE / 2],
             playhead: 0,
             current_track: "No track loaded".to_string(),
@@ -59,12 +58,12 @@ impl VisualizerApp {
 
 impl eframe::App for VisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // CRITICAL: Check if track ended naturally every frame
         self.audio_engine.check_finished();
         
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("🎛️ MinSu Audio Station").color(styles::TEXT_PRIMARY));
+                // EMOJI REMOVED
+                ui.heading(egui::RichText::new("MinSu Audio Station").color(styles::TEXT_PRIMARY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(&self.current_track)
                         .color(styles::TEXT_SECONDARY)
@@ -82,7 +81,8 @@ impl eframe::App for VisualizerApp {
                     styles::TEXT_SECONDARY 
                 };
                 
-                ui.label(egui::RichText::new("● LIVE").color(status_color).strong());
+                // EMOJI REMOVED
+                ui.label(egui::RichText::new("[LIVE]").color(status_color).strong());
                 ui.separator();
                 ui.label(egui::RichText::new(format!("SR: {}k | FFT: {}", SAMPLE_RATE/1000, FFT_SIZE))
                     .color(styles::TEXT_SECONDARY)
@@ -103,7 +103,8 @@ impl eframe::App for VisualizerApp {
                 ui.horizontal(|ui| {
                     ui.visuals_mut().button_frame = true;
                     
-                    if ui.button("📂 Load Track").clicked() {
+                    // EMOJI REMOVED
+                    if ui.button("Load Track").clicked() {
                         self.load_track();
                     }
                     
@@ -112,21 +113,22 @@ impl eframe::App for VisualizerApp {
                     let has_track = self.audio_engine.has_track();
                     let is_playing = self.audio_engine.is_playing();
                     
-                    let btn_text = if is_playing { "⏸ Pause" } else { "▶ Play" };
+                    // EMOJI REMOVED
+                    let btn_text = if is_playing { "Pause" } else { "Play" };
                     if ui.add_enabled(has_track, egui::Button::new(btn_text)).clicked() && has_track {
                         if let Err(e) = self.audio_engine.toggle_play_pause() {
                             eprintln!("Control Error: {}", e);
                         }
-                        // HARD RESET visuals on state change
                         if !self.audio_engine.is_playing() {
                             self.smoothed_spectrum.fill(0.0);
                         }
                     }
                     
-                    if ui.add_enabled(has_track, egui::Button::new("⏹ Stop")).clicked() && has_track {
+                    // EMOJI REMOVED
+                    if ui.add_enabled(has_track, egui::Button::new("Stop")).clicked() && has_track {
                         self.audio_engine.stop();
                         self.playhead = 0;
-                        self.smoothed_spectrum.fill(0.0); // INSTANT CLEAR
+                        self.smoothed_spectrum.fill(0.0);
                     }
                     
                     ui.add_space(15.0);
@@ -148,12 +150,10 @@ impl eframe::App for VisualizerApp {
                 if let Some(samples) = &*data_lock {
                     let is_playing = self.audio_engine.is_playing();
                     
-                    // ONLY advance playhead if actively playing
                     if is_playing {
                         self.playhead = (self.playhead + SAMPLES_PER_FRAME) % samples.len();
                     }
                     
-                    // PROCESS FFT only if playing OR if we have residual energy to clear
                     let has_energy = self.smoothed_spectrum.iter().any(|&x| x > 0.001);
                     
                     if samples.len() >= FFT_SIZE && (is_playing || has_energy) {
@@ -161,24 +161,22 @@ impl eframe::App for VisualizerApp {
                         let raw_spectrum = self.fft_processor.process(&samples[safe_start..safe_start + FFT_SIZE]);
                         
                         if is_playing {
-                            // Normal smoothing during playback
                             for i in 0..self.smoothed_spectrum.len() {
                                 let target = raw_spectrum[i];
                                 self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.4;
                             }
                         } else {
-                            // HARD DECAY to zero when stopped/paused (fast fade out)
                             for val in self.smoothed_spectrum.iter_mut() {
-                                *val *= 0.5; // Fast decay
-                                if *val < 0.001 { *val = 0.0; } // Snap to zero
+                                *val *= 0.5;
+                                if *val < 0.001 { *val = 0.0; }
                             }
                         }
                     } else if !is_playing && !has_energy {
-                        // Ensure completely zero when idle
                         self.smoothed_spectrum.fill(0.0);
                     }
                     
-                    renderer::draw_visualizer(ui, samples, &self.smoothed_spectrum, self.playhead);
+                    // UPDATED: Pass total length for progress bar
+                    renderer::draw_visualizer(ui, samples, &self.smoothed_spectrum, self.playhead, samples.len());
                 } else {
                     ui.add_space(100.0);
                     ui.label(egui::RichText::new("Load an MP3 to begin analysis")
@@ -188,7 +186,6 @@ impl eframe::App for VisualizerApp {
             });
         });
         
-        // ONLY request repaint if playing OR if there's visual energy to clear
         let needs_repaint = self.audio_engine.is_playing() 
             || self.smoothed_spectrum.iter().any(|&x| x > 0.001);
             

@@ -1,17 +1,77 @@
 use eframe::egui::{self, Pos2, Rect, Stroke, Color32, Rounding};
-use eframe::epaint::{PathShape, Mesh}; // Removed TessellationOptions
+use eframe::epaint::{PathShape, Mesh};
 use super::styles;
 
-pub fn draw_visualizer(ui: &mut egui::Ui, samples: &[f32], spectrum: &[f32], playhead: usize) {
+// UPDATED: Added total_samples parameter
+pub fn draw_visualizer(ui: &mut egui::Ui, samples: &[f32], spectrum: &[f32], playhead: usize, total_samples: usize) {
     ui.vertical_centered(|ui| {
         let max_height = ui.available_height();
-        let wave_height = (max_height * 0.45).min(220.0);
-        let spec_height = (max_height * 0.45).min(240.0);
+        
+        // Allocate space for overview, waveform, and spectrum
+        let overview_height = 60.0;
+        let wave_height = (max_height * 0.40).min(200.0);
+        let spec_height = (max_height * 0.40).min(220.0);
+        
+        // NEW: Draw full track overview at the top
+        draw_track_overview(ui, samples, playhead, total_samples, overview_height);
+        ui.add_space(10.0);
         
         draw_waveform_panel(ui, samples, playhead, wave_height);
         ui.add_space(20.0);
         draw_spectrum_panel(ui, spectrum, spec_height);
     });
+}
+
+/// Draws a miniaturized full-track waveform with a vertical playhead indicator
+fn draw_track_overview(ui: &mut egui::Ui, samples: &[f32], playhead: usize, total_samples: usize, height: f32) {
+    let panel_rect = ui.available_rect_before_wrap();
+    let rect = Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), height));
+    
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, Rounding::same(8.0), styles::PANEL_BG);
+    
+    if total_samples == 0 { return; }
+    
+    // Downsample for performance: one point per 2 pixels
+    let width = rect.width() - 20.0;
+    let start_x = rect.left() + 10.0;
+    let mid_y = rect.center().y;
+    let step = (total_samples as f32 / width).max(1.0);
+    let num_points = (width / 2.0) as usize;
+    
+    let mut points: Vec<Pos2> = Vec::with_capacity(num_points);
+    for i in 0..num_points {
+        let sample_idx = ((i as f32 * step) as usize).min(total_samples - 1);
+        let s = samples[sample_idx];
+        let x = start_x + (i as f32 * 2.0);
+        let y = mid_y - s * (height / 3.0);
+        points.push(Pos2::new(x, y));
+    }
+    
+    // Draw overview waveform
+    if points.len() > 1 {
+        painter.add(PathShape::line(points, Stroke::new(1.0, styles::OVERVIEW_WAVE)));
+    }
+    
+    // Draw playhead bar
+    let progress = playhead as f32 / total_samples as f32;
+    let head_x = start_x + (progress * width);
+    let head_line = PathShape::line(
+        vec![Pos2::new(head_x, rect.top()), Pos2::new(head_x, rect.bottom())],
+        Stroke::new(2.0, styles::PLAYHEAD_COLOR)
+    );
+    painter.add(head_line);
+    
+    // Label
+    painter.text(
+        rect.left_top() + egui::vec2(10.0, 5.0),
+        egui::Align2::LEFT_TOP,
+        "TRACK OVERVIEW",
+        egui::FontId::proportional(9.0),
+        styles::TEXT_SECONDARY,
+    );
+    
+    ui.allocate_rect(rect, egui::Sense::hover());
 }
 
 fn draw_waveform_panel(ui: &mut egui::Ui, samples: &[f32], playhead: usize, height: f32) {
@@ -43,7 +103,6 @@ fn draw_waveform_panel(ui: &mut egui::Ui, samples: &[f32], playhead: usize, heig
             points_bottom.push(Pos2::new(x, mid_y));
         }
         
-        // Filled Area Mesh
         let mut mesh = Mesh::default();
         for i in 0..points_top.len().saturating_sub(1) {
             mesh.colored_vertex(points_top[i], styles::WAVE_FILL);
@@ -56,12 +115,9 @@ fn draw_waveform_panel(ui: &mut egui::Ui, samples: &[f32], playhead: usize, heig
             mesh.add_triangle(idx+1, idx+3, idx+2);
         }
         painter.add(mesh);
-        
-        // Top Line
         painter.add(PathShape::line(points_top, Stroke::new(2.0, styles::WAVE_COLOR)));
     }
     
-    // FIXED: Removed .spacing()
     painter.text(
         rect.left_top() + egui::vec2(20.0, 15.0),
         egui::Align2::LEFT_TOP,
@@ -126,7 +182,6 @@ fn draw_spectrum_panel(ui: &mut egui::Ui, spectrum: &[f32], height: f32) {
         }
     }
     
-    // FIXED: Removed .spacing()
     painter.text(
         rect.left_top() + egui::vec2(20.0, 15.0),
         egui::Align2::LEFT_TOP,
