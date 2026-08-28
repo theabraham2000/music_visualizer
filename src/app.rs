@@ -118,11 +118,11 @@ impl eframe::App for VisualizerApp {
 
         // === TOP BAR ===
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("MINSU AUDIO STATION")
+                ui.label(egui::RichText::new("MinSu Music Vizualizer")
                     .color(styles::TEXT_PRIMARY)
-                    .size(16.0)
+                    .size(15.0)
                     .strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let live_color = if self.audio_engine.is_playing() {
@@ -130,17 +130,19 @@ impl eframe::App for VisualizerApp {
                     } else {
                         styles::TEXT_SECONDARY
                     };
-                    ui.label(egui::RichText::new("LIVE").color(live_color).strong().size(12.0));
+                    ui.label(egui::RichText::new("LIVE").color(live_color).strong().size(11.0));
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("v0.5.0").color(styles::TEXT_SECONDARY).size(10.0));
                 });
             });
 
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             ui.separator();
 
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.current_track)
                     .color(styles::TEXT_PRIMARY)
-                    .size(13.0));
+                    .size(12.0));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pos = self.audio_engine.position_seconds();
@@ -153,22 +155,21 @@ impl eframe::App for VisualizerApp {
                     ui.label(egui::RichText::new(format!("{} / {}", fmt_time(pos), fmt_time(dur)))
                         .color(styles::TEXT_SECONDARY)
                         .monospace()
-                        .size(12.0));
+                        .size(11.0));
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(3.0);
         });
 
-        // === BOTTOM CONTROLS ===
-        egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
-            ui.add_space(6.0);
+        // === BOTTOM CONTROLS (guaranteed visible) ===
+        egui::TopBottomPanel::bottom("controls").frame(egui::Frame::none().fill(styles::BG_PRIMARY).inner_margin(8.0)).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.visuals_mut().button_frame = true;
 
                 if ui.button("Load").clicked() {
                     self.load_track();
                 }
-                ui.add_space(10.0);
+                ui.add_space(12.0);
 
                 let has_track = self.audio_engine.has_track();
                 let is_playing = self.audio_engine.is_playing();
@@ -179,7 +180,7 @@ impl eframe::App for VisualizerApp {
                         eprintln!("Control Error: {}", e);
                     }
                 }
-                ui.add_space(10.0);
+                ui.add_space(12.0);
 
                 if ui.add_enabled(has_track, egui::Button::new("Stop")).clicked() && has_track {
                     self.audio_engine.stop();
@@ -189,119 +190,122 @@ impl eframe::App for VisualizerApp {
                     self.rms_smoothed = -60.0;
                     self.peak_hold = -60.0;
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let status_text = if is_playing { "Playing" }
+                                      else if has_track { "Paused" }
+                                      else { "Ready" };
+                    let status_color = if is_playing { styles::WAVE_COLOR }
+                                       else if has_track { styles::FREQ_MID }
+                                       else { styles::TEXT_SECONDARY };
+                    ui.label(egui::RichText::new(status_text).color(status_color).size(11.0));
+                });
             });
-            ui.add_space(6.0);
         });
 
-        // === CENTRAL VISUALIZATION ===
+        // === CENTRAL VISUALIZATION (scrollable to prevent clipping) ===
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().visuals.widgets.inactive.bg_fill = styles::BG_PRIMARY;
             ui.style_mut().visuals.widgets.inactive.weak_bg_fill = styles::BG_PRIMARY;
 
-            let data_lock = self.audio_data.lock().unwrap();
-            if let Some(data) = &*data_lock {
-                let is_playing = self.audio_engine.is_playing();
-                let sample_rate = data.sample_rate;
-                let playhead = self.audio_engine.position_samples(sample_rate);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let data_lock = self.audio_data.lock().unwrap();
+                if let Some(data) = &*data_lock {
+                    let is_playing = self.audio_engine.is_playing();
+                    let sample_rate = data.sample_rate;
+                    let playhead = self.audio_engine.position_samples(sample_rate);
 
-                // --- Analysis driven by engine clock ---
-                // Use larger window for phase meter visibility
-                let phase_window = 2048;
-                let (left, right) = Self::get_stereo_window(data, playhead, phase_window);
+                    let phase_window = 2048;
+                    let (left, right) = Self::get_stereo_window(data, playhead, phase_window);
 
-                // Use left channel for FFT (or mix: could average L+R)
-                let mono_mix: Vec<f32> = left.iter().zip(right.iter())
-                    .map(|(&l, &r)| (l + r) * 0.5)
-                    .collect();
+                    let mono_mix: Vec<f32> = left.iter().zip(right.iter())
+                        .map(|(&l, &r)| (l + r) * 0.5)
+                        .collect();
 
-                let has_energy = self.smoothed_spectrum.iter().any(|&x| x > 0.0001);
+                    let has_energy = self.smoothed_spectrum.iter().any(|&x| x > 0.0001);
 
-                if mono_mix.len() >= FFT_SIZE && (is_playing || has_energy) {
-                    // Center FFT window on playhead
-                    let raw_spectrum = self.fft_processor.process(&mono_mix[..FFT_SIZE]);
+                    if mono_mix.len() >= FFT_SIZE && (is_playing || has_energy) {
+                        let raw_spectrum = self.fft_processor.process(&mono_mix[..FFT_SIZE]);
 
-                    if is_playing {
-                        for i in 0..self.smoothed_spectrum.len() {
-                            let target = raw_spectrum[i];
-                            self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.3;
+                        if is_playing {
+                            for i in 0..self.smoothed_spectrum.len() {
+                                let target = raw_spectrum[i];
+                                self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.3;
+                            }
+                        } else {
+                            for val in self.smoothed_spectrum.iter_mut() {
+                                *val *= 0.5;
+                                if *val < 0.0001 { *val = 0.0; }
+                            }
                         }
-                    } else {
-                        for val in self.smoothed_spectrum.iter_mut() {
-                            *val *= 0.5;
-                            if *val < 0.0001 { *val = 0.0; }
+
+                        if is_playing {
+                            self.spectrogram_history.push(raw_spectrum.clone());
+                            if self.spectrogram_history.len() > SPECTROGRAM_WIDTH {
+                                self.spectrogram_history.remove(0);
+                            }
                         }
+
+                        let rms = (mono_mix.iter().map(|s| s * s).sum::<f32>() / mono_mix.len() as f32).sqrt();
+                        let db = if rms > 1e-6 { 20.0 * rms.log10() } else { -60.0 };
+                        self.rms_smoothed += (db - self.rms_smoothed) * 0.15;
+
+                        if db > self.peak_hold {
+                            self.peak_hold = db;
+                            self.peak_decay_timer = 1.0;
+                        } else if self.peak_decay_timer > 0.0 {
+                            self.peak_decay_timer -= 1.0 / 60.0;
+                        } else {
+                            self.peak_hold += (db - self.peak_hold) * 0.05;
+                        }
+
+                        if is_playing {
+                            let points: Vec<egui::Pos2> = mono_mix.iter()
+                                .enumerate()
+                                .step_by(4)
+                                .map(|(i, &s)| egui::Pos2::new(i as f32, -s * 50.0))
+                                .collect();
+                            self.persistence_buffer.push(points);
+                            if self.persistence_buffer.len() > PERSISTENCE_FRAMES {
+                                self.persistence_buffer.remove(0);
+                            }
+                        }
+
+                        let bass_end = (200.0 / (sample_rate as f32 / FFT_SIZE as f32)) as usize;
+                        let bass_energy: f32 = raw_spectrum[..bass_end.min(raw_spectrum.len())]
+                            .iter().sum::<f32>() / bass_end.max(1) as f32;
+                        let bass_db = if bass_energy > 1e-6 { 20.0 * bass_energy.log10() + 60.0 } else { 0.0 };
+                        let _bass_norm = (bass_db / 60.0).clamp(0.0, 1.0);
+                        self.radial_rotation += 0.002 + _bass_norm * 0.008;
+                    } else if !is_playing && !has_energy {
+                        self.smoothed_spectrum.fill(0.0);
                     }
 
-                    // Spectrogram history
-                    if is_playing {
-                        self.spectrogram_history.push(raw_spectrum.clone());
-                        if self.spectrogram_history.len() > SPECTROGRAM_WIDTH {
-                            self.spectrogram_history.remove(0);
-                        }
-                    }
-
-                    // RMS in dBFS
-                    let rms = (mono_mix.iter().map(|s| s * s).sum::<f32>() / mono_mix.len() as f32).sqrt();
-                    let db = if rms > 1e-6 { 20.0 * rms.log10() } else { -60.0 };
-                    self.rms_smoothed += (db - self.rms_smoothed) * 0.15;
-
-                    if db > self.peak_hold {
-                        self.peak_hold = db;
-                        self.peak_decay_timer = 1.0;
-                    } else if self.peak_decay_timer > 0.0 {
-                        self.peak_decay_timer -= 1.0 / 60.0;
-                    } else {
-                        self.peak_hold += (db - self.peak_hold) * 0.05;
-                    }
-
-                    // Persistence oscilloscope
-                    if is_playing {
-                        let points: Vec<egui::Pos2> = mono_mix.iter()
-                            .enumerate()
-                            .step_by(4)
-                            .map(|(i, &s)| egui::Pos2::new(i as f32, -s * 50.0))
-                            .collect();
-                        self.persistence_buffer.push(points);
-                        if self.persistence_buffer.len() > PERSISTENCE_FRAMES {
-                            self.persistence_buffer.remove(0);
-                        }
-                    }
-
-                    // Music-reactive rotation: bass drives speed
-                    let bass_end = (200.0 / (sample_rate as f32 / FFT_SIZE as f32)) as usize;
-                    let bass_energy: f32 = raw_spectrum[..bass_end.min(raw_spectrum.len())]
-                        .iter().sum::<f32>() / bass_end.max(1) as f32;
-                    let bass_db = if bass_energy > 1e-6 { 20.0 * bass_energy.log10() + 60.0 } else { 0.0 };
-                    let bass_norm = (bass_db / 60.0).clamp(0.0, 1.0);
-                    self.radial_rotation += 0.002 + bass_norm * 0.008;
-                } else if !is_playing && !has_energy {
-                    self.smoothed_spectrum.fill(0.0);
+                    renderer::draw_visualizer(
+                        ui,
+                        &self.overview_envelope,
+                        &self.smoothed_spectrum,
+                        playhead,
+                        data.samples.len() / data.channels,
+                        &self.spectrogram_history,
+                        &self.persistence_buffer,
+                        &left,
+                        &right,
+                        self.rms_smoothed,
+                        self.peak_hold,
+                        self.radial_rotation,
+                        bass_norm_for_pulse(&self.smoothed_spectrum, sample_rate),
+                        sample_rate,
+                    );
+                } else {
+                    ui.vertical_centered_justified(|ui| {
+                        ui.add_space(80.0);
+                        ui.label(egui::RichText::new("Load an MP3 to begin")
+                            .size(18.0)
+                            .color(styles::TEXT_SECONDARY));
+                    });
                 }
-
-                renderer::draw_visualizer(
-                    ui,
-                    &self.overview_envelope,
-                    &self.smoothed_spectrum,
-                    playhead,
-                    data.samples.len() / data.channels,
-                    &self.spectrogram_history,
-                    &self.persistence_buffer,
-                    &left,
-                    &right,
-                    self.rms_smoothed,
-                    self.peak_hold,
-                    self.radial_rotation,
-                    bass_norm_for_pulse(&self.smoothed_spectrum, sample_rate),
-                    sample_rate,  // <-- NEW: pass sample rate for correct freq mapping
-                );
-            } else {
-                ui.vertical_centered_justified(|ui| {
-                    ui.add_space(100.0);
-                    ui.label(egui::RichText::new("Load an MP3 to begin")
-                        .size(20.0)
-                        .color(styles::TEXT_SECONDARY));
-                });
-            }
+            });
         });
 
         let needs_repaint = self.audio_engine.is_playing()

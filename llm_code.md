@@ -62,47 +62,45 @@ use crate::audio::{loader, engine::AudioEngine, processor::FftProcessor};
 use crate::viz::renderer;
 use crate::viz::styles;
 
-const SAMPLE_RATE: u32 = 44100;
 const FFT_SIZE: usize = 2048;
-const SAMPLES_PER_FRAME: usize = (SAMPLE_RATE / 60) as usize;
-const SPECTROGRAM_WIDTH: usize = 300; // Columns of history to keep
-const PERSISTENCE_FRAMES: usize = 8;  // How many frames to trail
+const SPECTROGRAM_WIDTH: usize = 400;
+const PERSISTENCE_FRAMES: usize = 8;
 
 pub struct VisualizerApp {
-    samples: Arc<Mutex<Option<Vec<f32>>>>,
+    audio_data: Arc<Mutex<Option<loader::AudioData>>>,
     audio_engine: AudioEngine,
     fft_processor: FftProcessor,
     smoothed_spectrum: Vec<f32>,
-    playhead: usize,
     current_track: String,
-    
-    // NEW: Panel-specific state
-    spectrogram_history: Vec<Vec<f32>>, // Ring buffer of FFT columns
-    persistence_buffer: Vec<Vec<egui::Pos2>>, // Last N frames of waveform points
+
+    spectrogram_history: Vec<Vec<f32>>,
+    persistence_buffer: Vec<Vec<egui::Pos2>>,
     rms_smoothed: f32,
     peak_hold: f32,
     peak_decay_timer: f32,
     radial_rotation: f32,
+
+    // Precomputed min/max envelope for track overview
+    overview_envelope: Vec<(f32, f32)>,
 }
 
 impl VisualizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        
+
         Self {
-            samples: Arc::new(Mutex::new(None)),
+            audio_data: Arc::new(Mutex::new(None)),
             audio_engine: AudioEngine::new(),
             fft_processor: FftProcessor::new(FFT_SIZE),
             smoothed_spectrum: vec![0.0; FFT_SIZE / 2],
-            playhead: 0,
             current_track: "No track loaded".to_string(),
-            
             spectrogram_history: Vec::with_capacity(SPECTROGRAM_WIDTH),
             persistence_buffer: Vec::with_capacity(PERSISTENCE_FRAMES),
-            rms_smoothed: 0.0,
-            peak_hold: 0.0,
+            rms_smoothed: -60.0,
+            peak_hold: -60.0,
             peak_decay_timer: 0.0,
             radial_rotation: 0.0,
+            overview_envelope: Vec::new(),
         }
     }
 
@@ -112,23 +110,32 @@ impl VisualizerApp {
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
-                
+
             match loader::decode_mp3(path.clone()) {
                 Ok(data) => {
-                    *self.samples.lock().unwrap() = Some(data);
-                    self.playhead = 0;
+                    // Build min/max envelope for overview waveform
+                    let pixels = 800;
+                    let samples_per_pixel = (data.samples.len() / pixels).max(1);
+                    let mut envelope = Vec::with_capacity(pixels);
+                    for chunk in data.samples.chunks(samples_per_pixel) {
+                        let min = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        envelope.push((min, max));
+                    }
+                    self.overview_envelope = envelope;
+
+                    *self.audio_data.lock().unwrap() = Some(data);
                     self.current_track = file_name;
                     self.smoothed_spectrum.fill(0.0);
-                    
-                    // Reset panel states on new track
                     self.spectrogram_history.clear();
                     self.persistence_buffer.clear();
-                    self.rms_smoothed = 0.0;
-                    self.peak_hold = 0.0;
+                    self.rms_smoothed = -60.0;
+                    self.peak_hold = -60.0;
                     self.peak_decay_timer = 0.0;
                     self.radial_rotation = 0.0;
-                    
-                    if let Err(e) = self.audio_engine.load(path) {
+
+                    let dur = self.audio_data.lock().unwrap().as_ref().unwrap().duration_secs;
+                    if let Err(e) = self.audio_engine.load(path, dur) {
                         eprintln!("Audio Error: {}", e);
                     }
                 }
@@ -136,183 +143,246 @@ impl VisualizerApp {
             }
         }
     }
+
+    /// Extract properly separated L/R channels from interleaved buffer
+    fn get_stereo_window(data: &loader::AudioData, playhead: usize, window_size: usize) -> (Vec<f32>, Vec<f32>) {
+        let total_frames = data.samples.len() / data.channels;
+        let start_frame = playhead.min(total_frames.saturating_sub(window_size));
+        let end_frame = (start_frame + window_size).min(total_frames);
+
+        let mut left = Vec::with_capacity(end_frame - start_frame);
+        let mut right = Vec::with_capacity(end_frame - start_frame);
+
+        if data.channels == 2 {
+            for frame in start_frame..end_frame {
+                left.push(data.samples[frame * 2]);
+                right.push(data.samples[frame * 2 + 1]);
+            }
+        } else {
+            // Mono: duplicate to both channels
+            for frame in start_frame..end_frame {
+                let s = data.samples[frame];
+                left.push(s);
+                right.push(s);
+            }
+        }
+        (left, right)
+    }
 }
 
 impl eframe::App for VisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.audio_engine.check_finished();
-        
+
+        // === TOP BAR ===
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("MinSu Audio Station").color(styles::TEXT_PRIMARY));
+                ui.label(egui::RichText::new("MinSu Music Vizualizer")
+                    .color(styles::TEXT_PRIMARY)
+                    .size(15.0)
+                    .strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(&self.current_track)
-                        .color(styles::TEXT_SECONDARY)
-                        .size(14.0)
-                        .monospace());
+                    let live_color = if self.audio_engine.is_playing() {
+                        styles::WAVE_COLOR
+                    } else {
+                        styles::TEXT_SECONDARY
+                    };
+                    ui.label(egui::RichText::new("LIVE").color(live_color).strong().size(11.0));
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("v0.5.0").color(styles::TEXT_SECONDARY).size(10.0));
                 });
             });
-        });
-        
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+
+            ui.add_space(3.0);
+            ui.separator();
+
             ui.horizontal(|ui| {
-                let status_color = if self.audio_engine.is_playing() { 
-                    styles::WAVE_COLOR 
-                } else { 
-                    styles::TEXT_SECONDARY 
-                };
-                ui.label(egui::RichText::new("[LIVE]").color(status_color).strong());
-                ui.separator();
-                ui.label(egui::RichText::new(format!("SR: {}k | FFT: {}", SAMPLE_RATE/1000, FFT_SIZE))
-                    .color(styles::TEXT_SECONDARY)
+                ui.label(egui::RichText::new(&self.current_track)
+                    .color(styles::TEXT_PRIMARY)
                     .size(12.0));
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("v0.4.0-stable").color(styles::TEXT_SECONDARY).size(12.0));
+                    let pos = self.audio_engine.position_seconds();
+                    let dur = self.audio_engine.duration_seconds();
+                    let fmt_time = |t: f32| -> String {
+                        let m = (t / 60.0) as u32;
+                        let s = (t % 60.0) as u32;
+                        format!("{:02}:{:02}", m, s)
+                    };
+                    ui.label(egui::RichText::new(format!("{} / {}", fmt_time(pos), fmt_time(dur)))
+                        .color(styles::TEXT_SECONDARY)
+                        .monospace()
+                        .size(11.0));
+                });
+            });
+            ui.add_space(3.0);
+        });
+
+        // === BOTTOM CONTROLS (guaranteed visible) ===
+        egui::TopBottomPanel::bottom("controls").frame(egui::Frame::none().fill(styles::BG_PRIMARY).inner_margin(8.0)).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.visuals_mut().button_frame = true;
+
+                if ui.button("Load").clicked() {
+                    self.load_track();
+                }
+                ui.add_space(12.0);
+
+                let has_track = self.audio_engine.has_track();
+                let is_playing = self.audio_engine.is_playing();
+
+                let btn_text = if is_playing { "Pause" } else { "Play" };
+                if ui.add_enabled(has_track, egui::Button::new(btn_text)).clicked() && has_track {
+                    if let Err(e) = self.audio_engine.toggle_play_pause() {
+                        eprintln!("Control Error: {}", e);
+                    }
+                }
+                ui.add_space(12.0);
+
+                if ui.add_enabled(has_track, egui::Button::new("Stop")).clicked() && has_track {
+                    self.audio_engine.stop();
+                    self.smoothed_spectrum.fill(0.0);
+                    self.spectrogram_history.clear();
+                    self.persistence_buffer.clear();
+                    self.rms_smoothed = -60.0;
+                    self.peak_hold = -60.0;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let status_text = if is_playing { "Playing" }
+                                      else if has_track { "Paused" }
+                                      else { "Ready" };
+                    let status_color = if is_playing { styles::WAVE_COLOR }
+                                       else if has_track { styles::FREQ_MID }
+                                       else { styles::TEXT_SECONDARY };
+                    ui.label(egui::RichText::new(status_text).color(status_color).size(11.0));
                 });
             });
         });
-        
+
+        // === CENTRAL VISUALIZATION (scrollable to prevent clipping) ===
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().visuals.widgets.inactive.bg_fill = styles::BG_PRIMARY;
             ui.style_mut().visuals.widgets.inactive.weak_bg_fill = styles::BG_PRIMARY;
-            
-            ui.vertical_centered(|ui| {
-                ui.add_space(10.0);
-                
-                ui.horizontal(|ui| {
-                    ui.visuals_mut().button_frame = true;
-                    if ui.button("Load Track").clicked() { self.load_track(); }
-                    ui.add_space(15.0);
-                    
-                    let has_track = self.audio_engine.has_track();
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let data_lock = self.audio_data.lock().unwrap();
+                if let Some(data) = &*data_lock {
                     let is_playing = self.audio_engine.is_playing();
-                    
-                    let btn_text = if is_playing { "Pause" } else { "Play" };
-                    if ui.add_enabled(has_track, egui::Button::new(btn_text)).clicked() && has_track {
-                        if let Err(e) = self.audio_engine.toggle_play_pause() {
-                            eprintln!("Control Error: {}", e);
-                        }
-                        if !self.audio_engine.is_playing() {
-                            self.smoothed_spectrum.fill(0.0);
-                        }
-                    }
-                    
-                    if ui.add_enabled(has_track, egui::Button::new("Stop")).clicked() && has_track {
-                        self.audio_engine.stop();
-                        self.playhead = 0;
-                        self.smoothed_spectrum.fill(0.0);
-                    }
-                    
-                    ui.add_space(15.0);
-                    let status_text = if is_playing { "Playing" } 
-                                      else if has_track { "Paused" } 
-                                      else { "Ready" };
-                    let status_color = if is_playing { styles::WAVE_COLOR } 
-                                       else if has_track { styles::FREQ_MID } 
-                                       else { styles::TEXT_SECONDARY };
-                    ui.label(egui::RichText::new(status_text).color(status_color).strong().size(14.0));
-                });
-                
-                ui.add_space(15.0);
-                
-                let data_lock = self.samples.lock().unwrap();
-                if let Some(samples) = &*data_lock {
-                    let is_playing = self.audio_engine.is_playing();
-                    
-                    if is_playing {
-                        self.playhead = (self.playhead + SAMPLES_PER_FRAME) % samples.len();
-                    }
-                    
-                    let has_energy = self.smoothed_spectrum.iter().any(|&x| x > 0.001);
-                    
-                    if samples.len() >= FFT_SIZE && (is_playing || has_energy) {
-                        let safe_start = self.playhead.min(samples.len() - FFT_SIZE);
-                        let window = &samples[safe_start..safe_start + FFT_SIZE];
-                        let raw_spectrum = self.fft_processor.process(window);
-                        
-                        // Update smoothed spectrum
+                    let sample_rate = data.sample_rate;
+                    let playhead = self.audio_engine.position_samples(sample_rate);
+
+                    let phase_window = 2048;
+                    let (left, right) = Self::get_stereo_window(data, playhead, phase_window);
+
+                    let mono_mix: Vec<f32> = left.iter().zip(right.iter())
+                        .map(|(&l, &r)| (l + r) * 0.5)
+                        .collect();
+
+                    let has_energy = self.smoothed_spectrum.iter().any(|&x| x > 0.0001);
+
+                    if mono_mix.len() >= FFT_SIZE && (is_playing || has_energy) {
+                        let raw_spectrum = self.fft_processor.process(&mono_mix[..FFT_SIZE]);
+
                         if is_playing {
                             for i in 0..self.smoothed_spectrum.len() {
                                 let target = raw_spectrum[i];
-                                self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.4;
+                                self.smoothed_spectrum[i] += (target - self.smoothed_spectrum[i]) * 0.3;
                             }
                         } else {
                             for val in self.smoothed_spectrum.iter_mut() {
                                 *val *= 0.5;
-                                if *val < 0.001 { *val = 0.0; }
+                                if *val < 0.0001 { *val = 0.0; }
                             }
                         }
-                        
-                        // UPDATE: Spectrogram History (push new column, pop oldest)
+
                         if is_playing {
                             self.spectrogram_history.push(raw_spectrum.clone());
                             if self.spectrogram_history.len() > SPECTROGRAM_WIDTH {
                                 self.spectrogram_history.remove(0);
                             }
                         }
-                        
-                        // UPDATE: RMS / Peak Hold Calculation
-                        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-                        let db = if rms > 0.0 { 20.0 * rms.log10() } else { -60.0 };
+
+                        let rms = (mono_mix.iter().map(|s| s * s).sum::<f32>() / mono_mix.len() as f32).sqrt();
+                        let db = if rms > 1e-6 { 20.0 * rms.log10() } else { -60.0 };
                         self.rms_smoothed += (db - self.rms_smoothed) * 0.15;
-                        
+
                         if db > self.peak_hold {
                             self.peak_hold = db;
-                            self.peak_decay_timer = 1.0; // Hold for ~1 second at 60fps
+                            self.peak_decay_timer = 1.0;
                         } else if self.peak_decay_timer > 0.0 {
                             self.peak_decay_timer -= 1.0 / 60.0;
                         } else {
-                            self.peak_hold += (db - self.peak_hold) * 0.05; // Slow decay after hold
+                            self.peak_hold += (db - self.peak_hold) * 0.05;
                         }
-                        
-                        // UPDATE: Persistence Oscilloscope Buffer
+
                         if is_playing {
-                            let mid_y = 0.0; // Will be offset in renderer
-                            let step = 1.0;
-                            let points: Vec<egui::Pos2> = window.iter().enumerate()
-                                .step_by(4) // Downsample for performance
-                                .map(|(i, &s)| egui::Pos2::new(i as f32 * step, mid_y - s * 50.0))
+                            let points: Vec<egui::Pos2> = mono_mix.iter()
+                                .enumerate()
+                                .step_by(4)
+                                .map(|(i, &s)| egui::Pos2::new(i as f32, -s * 50.0))
                                 .collect();
                             self.persistence_buffer.push(points);
                             if self.persistence_buffer.len() > PERSISTENCE_FRAMES {
                                 self.persistence_buffer.remove(0);
                             }
                         }
-                        
-                        // UPDATE: Radial Rotation
-                        if is_playing {
-                            self.radial_rotation += 0.005;
-                        }
+
+                        let bass_end = (200.0 / (sample_rate as f32 / FFT_SIZE as f32)) as usize;
+                        let bass_energy: f32 = raw_spectrum[..bass_end.min(raw_spectrum.len())]
+                            .iter().sum::<f32>() / bass_end.max(1) as f32;
+                        let bass_db = if bass_energy > 1e-6 { 20.0 * bass_energy.log10() + 60.0 } else { 0.0 };
+                        let _bass_norm = (bass_db / 60.0).clamp(0.0, 1.0);
+                        self.radial_rotation += 0.002 + _bass_norm * 0.008;
                     } else if !is_playing && !has_energy {
                         self.smoothed_spectrum.fill(0.0);
                     }
-                    
+
                     renderer::draw_visualizer(
-                        ui, 
-                        samples, 
-                        &self.smoothed_spectrum, 
-                        self.playhead, 
-                        samples.len(),
+                        ui,
+                        &self.overview_envelope,
+                        &self.smoothed_spectrum,
+                        playhead,
+                        data.samples.len() / data.channels,
                         &self.spectrogram_history,
                         &self.persistence_buffer,
+                        &left,
+                        &right,
                         self.rms_smoothed,
                         self.peak_hold,
                         self.radial_rotation,
+                        bass_norm_for_pulse(&self.smoothed_spectrum, sample_rate),
+                        sample_rate,
                     );
                 } else {
-                    ui.add_space(100.0);
-                    ui.label(egui::RichText::new("Load an MP3 to begin analysis")
-                        .size(18.0)
-                        .color(styles::TEXT_SECONDARY));
+                    ui.vertical_centered_justified(|ui| {
+                        ui.add_space(80.0);
+                        ui.label(egui::RichText::new("Load an MP3 to begin")
+                            .size(18.0)
+                            .color(styles::TEXT_SECONDARY));
+                    });
                 }
             });
         });
-        
-        let needs_repaint = self.audio_engine.is_playing() 
-            || self.smoothed_spectrum.iter().any(|&x| x > 0.001);
+
+        let needs_repaint = self.audio_engine.is_playing()
+            || self.smoothed_spectrum.iter().any(|&x| x > 0.0001);
         if needs_repaint {
             ctx.request_repaint();
         }
+    }
+}
+
+/// Compute bass energy normalized 0..1 for radial pulse effect
+fn bass_norm_for_pulse(spectrum: &[f32], sample_rate: u32) -> f32 {
+    let bass_end = (200.0 / (sample_rate as f32 / FFT_SIZE as f32)) as usize;
+    let bass_energy: f32 = spectrum[..bass_end.min(spectrum.len())]
+        .iter().sum::<f32>() / bass_end.max(1) as f32;
+    if bass_energy > 1e-6 {
+        ((20.0 * bass_energy.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 ```
@@ -324,12 +394,16 @@ use rodio::{Decoder, Sink, OutputStream};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::time::Instant;
 
 pub struct AudioEngine {
     _stream: Option<OutputStream>,
     sink: Option<Sink>,
     current_path: Option<PathBuf>,
     is_playing: bool,
+    started_at: Option<Instant>,
+    paused_position_secs: f32,
+    duration_secs: f32,
 }
 
 impl AudioEngine {
@@ -339,12 +413,17 @@ impl AudioEngine {
             sink: None,
             current_path: None,
             is_playing: false,
+            started_at: None,
+            paused_position_secs: 0.0,
+            duration_secs: 0.0,
         }
     }
 
-    pub fn load(&mut self, path: PathBuf) -> Result<(), String> {
+    pub fn load(&mut self, path: PathBuf, duration_secs: f32) -> Result<(), String> {
         self.stop();
         self.current_path = Some(path.clone());
+        self.duration_secs = duration_secs;
+        self.paused_position_secs = 0.0;
 
         let (_stream, stream_handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
         let file = File::open(path).map_err(|e| e.to_string())?;
@@ -358,6 +437,7 @@ impl AudioEngine {
         self._stream = Some(_stream);
         self.sink = Some(sink);
         self.is_playing = true;
+        self.started_at = Some(Instant::now());
         Ok(())
     }
 
@@ -367,15 +447,20 @@ impl AudioEngine {
                 if let Some(sink) = &self.sink {
                     sink.pause();
                 }
+                // Freeze position
+                if let Some(started) = self.started_at {
+                    self.paused_position_secs += started.elapsed().as_secs_f32();
+                }
+                self.started_at = None;
                 self.is_playing = false;
             } else {
                 if self.sink.is_none() {
-                    return self.load(path.clone());
+                    return self.load(path.clone(), self.duration_secs);
                 }
-                
                 if let Some(sink) = &self.sink {
                     sink.play();
                 }
+                self.started_at = Some(Instant::now());
                 self.is_playing = true;
             }
         }
@@ -389,15 +474,38 @@ impl AudioEngine {
         self.sink = None;
         self._stream = None;
         self.is_playing = false;
+        self.started_at = None;
+        self.paused_position_secs = 0.0;
     }
 
-    /// Call this every frame to detect if track ended naturally
+    /// Returns the current playback position in seconds, derived from real elapsed time.
+    pub fn position_seconds(&self) -> f32 {
+        let elapsed = match (self.is_playing, self.started_at) {
+            (true, Some(started)) => self.paused_position_secs + started.elapsed().as_secs_f32(),
+            _ => self.paused_position_secs,
+        };
+        elapsed.min(self.duration_secs)
+    }
+
+    /// Returns the current playback position in samples (per-channel).
+    pub fn position_samples(&self, sample_rate: u32) -> usize {
+        (self.position_seconds() * sample_rate as f32) as usize
+    }
+
+    pub fn duration_seconds(&self) -> f32 {
+        self.duration_secs
+    }
+
     pub fn check_finished(&mut self) {
         if self.is_playing {
             if let Some(sink) = &self.sink {
-                // If sink is empty, the track has finished
                 if sink.empty() {
-                    self.stop();
+                    // Freeze at end position
+                    if let Some(started) = self.started_at {
+                        self.paused_position_secs += started.elapsed().as_secs_f32();
+                    }
+                    self.started_at = None;
+                    self.is_playing = false;
                 }
             }
         }
@@ -421,14 +529,29 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-pub fn decode_mp3(path: PathBuf) -> Result<Vec<f32>, String> {
+pub struct AudioData {
+    pub samples: Vec<f32>,
+    pub channels: usize,
+    pub sample_rate: u32,
+    pub duration_secs: f32,
+}
+
+pub fn decode_mp3(path: PathBuf) -> Result<AudioData, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
     let source = Decoder::new(reader).map_err(|e| e.to_string())?;
-    
-    // Convert all samples to f32
+
+    let channels = source.channels() as usize;
+    let sample_rate = source.sample_rate();
     let samples: Vec<f32> = source.convert_samples().collect();
-    Ok(samples)
+    let duration_secs = samples.len() as f32 / (sample_rate as f32 * channels as f32);
+
+    Ok(AudioData {
+        samples,
+        channels,
+        sample_rate,
+        duration_secs,
+    })
 }
 ```
 
@@ -493,7 +616,7 @@ use eframe::NativeOptions;
 fn main() -> Result<(), eframe::Error> {
     let options = NativeOptions::default();
     eframe::run_native(
-        "MinSu Audio Station",
+        "MinSu Music Vizualizer",
         options,
         Box::new(|cc| {
             Box::new(app::VisualizerApp::new(cc)) as Box<dyn eframe::App>
@@ -528,159 +651,191 @@ pub mod styles;
 
 ```rust
 use eframe::egui::{self, Pos2, Rect, Stroke, Color32, Rounding};
-use eframe::epaint::{PathShape, Mesh};
+use eframe::epaint::Mesh;
 use super::styles;
+use std::sync::LazyLock;
 
+// Logarithmic frequency band edges (Hz) for 96 bars spanning 20Hz-20kHz
+static LOG_BAND_EDGES: LazyLock<[f32; 97]> = LazyLock::new(|| {
+    let min_hz = 20.0_f32;
+    let max_hz = 20000.0_f32;
+    let log_min = min_hz.ln();
+    let log_max = max_hz.ln();
+    let mut bands = [0.0_f32; 97];
+    for i in 0..97 {
+        let t = i as f32 / 96.0;
+        bands[i] = (log_min + t * (log_max - log_min)).exp();
+    }
+    bands
+});
+
+#[allow(clippy::too_many_arguments)]
 pub fn draw_visualizer(
-    ui: &mut egui::Ui, 
-    samples: &[f32], 
-    spectrum: &[f32], 
-    playhead: usize, 
-    total_samples: usize,
+    ui: &mut egui::Ui,
+    overview_envelope: &[(f32, f32)],
+    spectrum: &[f32],
+    playhead: usize,
+    total_frames: usize,
     spectrogram_history: &[Vec<f32>],
-    persistence_buffer: &[Vec<Pos2>],
+    _persistence_buffer: &[Vec<Pos2>],
+    left_channel: &[f32],
+    right_channel: &[f32],
     rms_db: f32,
     peak_db: f32,
     radial_rotation: f32,
+    bass_pulse: f32,
+    sample_rate: u32,
 ) {
-    ui.vertical_centered(|ui| {
-        let max_height = ui.available_height();
-        let full_width = ui.available_width();
-        
-        // Top: Track Overview
-        draw_track_overview(ui, samples, playhead, total_samples, 50.0);
+    let full_width = ui.available_width();
+    let available_h = ui.available_height();
+
+    // FIXED: Use explicit fixed heights with guaranteed minimums
+    // Total budget: radial(300) + gap(8) + meters(56) + gap(8) + spectro(140) + gap(8) + wave(80) = 600
+    let radial_h = 300.0_f32.min(available_h * 0.50).max(200.0);
+    let meter_h = 56.0_f32;
+    let spectro_h = 140.0_f32.min(available_h * 0.22).max(80.0);
+    let wave_h = 80.0_f32.max(available_h - radial_h - meter_h - spectro_h - 40.0);
+
+    // ── HERO: Radial Spectrum ──────────────────────────────────────
+    let (_, radial_rect) = ui.allocate_space(egui::vec2(full_width, radial_h));
+    draw_radial_hero(ui.painter_at(radial_rect), radial_rect, spectrum, radial_rotation, bass_pulse, sample_rate);
+
+    ui.add_space(8.0);
+
+    // ── Secondary row: RMS (left) + Phase (right) ─────────────────
+    ui.horizontal(|ui| {
+        let half_w = full_width / 2.0 - 4.0;
+        let (_, rms_rect) = ui.allocate_space(egui::vec2(half_w, meter_h));
+        draw_rms_meter(ui.painter_at(rms_rect), rms_rect, rms_db, peak_db);
+
         ui.add_space(8.0);
-        
-        // Middle Row: Spectrogram (left) + Radial (center) + Phase/RMS (right)
-        let mid_row_height = (max_height * 0.35).min(220.0);
-        ui.horizontal(|ui| {
-            let col_w = full_width / 3.0 - 5.0;
-            
-            // Left: Spectrogram
-            let (_, spec_rect) = ui.allocate_space(egui::vec2(col_w, mid_row_height));
-            draw_spectrogram(ui.painter_at(spec_rect), spec_rect, spectrogram_history);
-            
-            ui.add_space(8.0);
-            
-            // Center: Radial Spectrum
-            let (_, rad_rect) = ui.allocate_space(egui::vec2(col_w, mid_row_height));
-            draw_radial_spectrum(ui.painter_at(rad_rect), rad_rect, spectrum, radial_rotation);
-            
-            ui.add_space(8.0);
-            
-            // Right Column: Phase Meter (top half) + RMS Meter (bottom half)
-            ui.vertical(|ui| {
-                let half_h = mid_row_height / 2.0 - 4.0;
-                
-                let (_, phase_rect) = ui.allocate_space(egui::vec2(col_w, half_h));
-                draw_phase_meter(ui.painter_at(phase_rect), phase_rect, samples, playhead);
-                
-                ui.add_space(8.0);
-                
-                let (_, rms_rect) = ui.allocate_space(egui::vec2(col_w, half_h));
-                draw_rms_meter(ui.painter_at(rms_rect), rms_rect, rms_db, peak_db);
-            });
-        });
-        
-        ui.add_space(8.0);
-        
-        // Bottom Row: Persistence Oscilloscope (left) + Standard Waveform/Spectrum (right)
-        let bot_row_height = (max_height * 0.35).min(200.0);
-        ui.horizontal(|ui| {
-            let half_w = full_width / 2.0 - 4.0;
-            
-            // Left: Persistence Oscilloscope
-            let (_, persist_rect) = ui.allocate_space(egui::vec2(half_w, bot_row_height));
-            draw_persistence_oscilloscope(ui.painter_at(persist_rect), persist_rect, persistence_buffer);
-            
-            ui.add_space(8.0);
-            
-            // Right: Standard panels stacked
-            ui.vertical(|ui| {
-                let half_h = bot_row_height / 2.0 - 4.0;
-                
-                let (_, wave_rect) = ui.allocate_space(egui::vec2(half_w, half_h));
-                draw_waveform_mini(ui.painter_at(wave_rect), wave_rect, samples, playhead);
-                
-                ui.add_space(8.0);
-                
-                let (_, spec_bar_rect) = ui.allocate_space(egui::vec2(half_w, half_h));
-                draw_spectrum_bars_mini(ui.painter_at(spec_bar_rect), spec_bar_rect, spectrum);
-            });
-        });
+
+        let (_, phase_rect) = ui.allocate_space(egui::vec2(half_w, meter_h));
+        draw_phase_meter(ui.painter_at(phase_rect), phase_rect, left_channel, right_channel);
     });
+
+    ui.add_space(8.0);
+
+    // ── Spectrogram ────────────────────────────────────────────────
+    let (_, spec_rect) = ui.allocate_space(egui::vec2(full_width, spectro_h));
+    draw_spectrogram(ui.painter_at(spec_rect), spec_rect, spectrogram_history);
+
+    ui.add_space(8.0);
+
+    // ── Waveform Timeline ──────────────────────────────────────────
+    let (_, wave_rect) = ui.allocate_space(egui::vec2(full_width, wave_h));
+    draw_waveform_timeline(ui.painter_at(wave_rect), wave_rect, overview_envelope, playhead, total_frames);
 }
 
+// =============================================================================
+// HERO RADIAL SPECTRUM
+// =============================================================================
+fn draw_radial_hero(painter: egui::Painter, rect: Rect, spectrum: &[f32], rotation: f32, bass_pulse: f32, sample_rate: u32) {
+    painter.rect_filled(rect, Rounding::same(16.0), styles::PANEL_BG);
+
+    let center = rect.center();
+    let base_radius = rect.width().min(rect.height()) * 0.40;
+    let pulse = 1.0 + bass_pulse * 0.12;
+    let radius = base_radius * pulse;
+    let inner_r = radius * 0.45;
+    let bar_count = 96;
+    let angle_step = std::f32::consts::TAU / bar_count as f32;
+    let nyquist = sample_rate as f32 / 2.0;
+
+    for i in 0..bar_count {
+        let low_hz = LOG_BAND_EDGES[i];
+        let high_hz = LOG_BAND_EDGES[i + 1];
+        let bin_low = ((low_hz / nyquist) * spectrum.len() as f32) as usize;
+        let bin_high = ((high_hz / nyquist) * spectrum.len() as f32) as usize;
+        let bin_low = bin_low.min(spectrum.len().saturating_sub(1));
+        let bin_high = bin_high.min(spectrum.len()).max(bin_low + 1);
+
+        let band_mag: f32 = spectrum[bin_low..bin_high].iter().sum::<f32>() / (bin_high - bin_low) as f32;
+        let db = if band_mag > 1e-6 { 20.0 * band_mag.log10() } else { -60.0 };
+        let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+
+        let angle = i as f32 * angle_step + rotation;
+        let outer_r = inner_r + normalized * (radius - inner_r);
+
+        let start = Pos2::new(center.x + angle.cos() * inner_r, center.y + angle.sin() * inner_r);
+        let end = Pos2::new(center.x + angle.cos() * outer_r, center.y + angle.sin() * outer_r);
+
+        let color = if i < bar_count / 3 {
+            styles::FREQ_LOW
+        } else if i < 2 * bar_count / 3 {
+            styles::FREQ_MID
+        } else {
+            styles::FREQ_HIGH
+        };
+
+        painter.line_segment([start, end], Stroke::new(3.0, color));
+    }
+
+    // Inner ring
+    painter.circle_stroke(center, inner_r - 2.0, Stroke::new(1.0, styles::RADIAL_BASE));
+
+    // Center label
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        "MinSu Lab",
+        egui::FontId::proportional(12.0),
+        styles::TEXT_PRIMARY,
+    );
+
+    // Frequency markers around the circle
+    let markers: [(f32, &str); 4] = [(20.0, "20"), (100.0, "100"), (1000.0, "1k"), (10000.0, "10k")];
+    for (hz, label) in &markers {
+        let frac = ((*hz).ln() - 20.0_f32.ln()) / (20000.0_f32.ln() - 20.0_f32.ln());
+        let angle = frac * std::f32::consts::TAU + rotation;
+        let label_r = radius + 16.0;
+        let pos = Pos2::new(center.x + angle.cos() * label_r, center.y + angle.sin() * label_r);
+        painter.text(pos, egui::Align2::CENTER_CENTER, *label, egui::FontId::proportional(8.0), styles::TEXT_SECONDARY);
+    }
+}
 
 // =============================================================================
-// 1. SPECTROGRAM (Heatmap)
+// SPECTROGRAM
 // =============================================================================
 fn draw_spectrogram(painter: egui::Painter, rect: Rect, history: &[Vec<f32>]) {
     painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
     if history.is_empty() { return; }
-    
+
     let cols = history.len();
-    let rows = 128; // Frequency bins to display
+    let rows = 128;
     let cell_w = rect.width() / cols as f32;
     let cell_h = rect.height() / rows as f32;
-    
+
     let mut mesh = Mesh::default();
-    
     for (col_idx, column) in history.iter().enumerate() {
         let x = rect.left() + col_idx as f32 * cell_w;
-        
         for row in 0..rows {
-            // Map row to FFT bin index (logarithmic-ish mapping for better visual)
-            let bin_idx = ((row as f32 / rows as f32).powf(1.5) * (column.len() as f32)) as usize;
+            let bin_idx = ((row as f32 / rows as f32).powf(1.5) * column.len() as f32) as usize;
             let mag = column.get(bin_idx).copied().unwrap_or(0.0);
-            
-            // Convert magnitude to dB-like scale for colormap
-            let db = if mag > 0.0 { 20.0 * mag.log10() + 60.0 } else { 0.0 };
+            let db = if mag > 1e-6 { 20.0 * mag.log10() + 60.0 } else { 0.0 };
             let t = (db / 60.0).clamp(0.0, 1.0);
-            
             let color = inferno_colormap(t);
-            
-            let y = rect.bottom() - (row as f32 * cell_h);
-            let cell_rect = Rect::from_min_size(Pos2::new(x, y - cell_h), egui::vec2(cell_w + 0.5, cell_h + 0.5));
-            
-            mesh.colored_vertex(cell_rect.left_top(), color);
-            mesh.colored_vertex(cell_rect.right_top(), color);
-            mesh.colored_vertex(cell_rect.left_bottom(), color);
-            mesh.colored_vertex(cell_rect.right_bottom(), color);
-            
+            let y = rect.bottom() - row as f32 * cell_h;
+            let cr = Rect::from_min_size(Pos2::new(x, y - cell_h), egui::vec2(cell_w + 0.5, cell_h + 0.5));
+            mesh.colored_vertex(cr.left_top(), color);
+            mesh.colored_vertex(cr.right_top(), color);
+            mesh.colored_vertex(cr.left_bottom(), color);
+            mesh.colored_vertex(cr.right_bottom(), color);
             let idx = mesh.vertices.len() as u32 - 4;
-            mesh.add_triangle(idx, idx+1, idx+2);
-            mesh.add_triangle(idx+1, idx+3, idx+2);
+            mesh.add_triangle(idx, idx + 1, idx + 2);
+            mesh.add_triangle(idx + 1, idx + 3, idx + 2);
         }
     }
-    
     painter.add(mesh);
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        "SPECTROGRAM",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
+
+    painter.text(rect.left_top() + egui::vec2(10.0, 6.0), egui::Align2::LEFT_TOP, "SPECTROGRAM", egui::FontId::proportional(9.0), styles::TEXT_SECONDARY);
 }
 
 fn inferno_colormap(t: f32) -> Color32 {
-    // Simplified inferno: black -> purple -> red -> yellow -> white
-    if t < 0.25 {
-        let s = t / 0.25;
-        lerp_color(styles::SPEC_COLD, styles::SPEC_COOL, s)
-    } else if t < 0.5 {
-        let s = (t - 0.25) / 0.25;
-        lerp_color(styles::SPEC_COOL, styles::SPEC_WARM, s)
-    } else if t < 0.75 {
-        let s = (t - 0.5) / 0.25;
-        lerp_color(styles::SPEC_WARM, styles::SPEC_HOT, s)
-    } else {
-        let s = (t - 0.75) / 0.25;
-        lerp_color(styles::SPEC_HOT, styles::SPEC_PEAK, s)
-    }
+    if t < 0.25 { lerp_color(styles::SPEC_COLD, styles::SPEC_COOL, t / 0.25) }
+    else if t < 0.5 { lerp_color(styles::SPEC_COOL, styles::SPEC_WARM, (t - 0.25) / 0.25) }
+    else if t < 0.75 { lerp_color(styles::SPEC_WARM, styles::SPEC_HOT, (t - 0.5) / 0.25) }
+    else { lerp_color(styles::SPEC_HOT, styles::SPEC_PEAK, (t - 0.75) / 0.25) }
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -693,340 +848,98 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 // =============================================================================
-// 2. CIRCULAR / RADIAL SPECTRUM
+// PHASE METER (Proper stereo goniometer)
 // =============================================================================
-fn draw_radial_spectrum(painter: egui::Painter, rect: Rect, spectrum: &[f32], rotation: f32) {
+fn draw_phase_meter(painter: egui::Painter, rect: Rect, left: &[f32], right: &[f32]) {
     painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
-    let center = rect.center();
-    let radius = (rect.width().min(rect.height()) / 2.0) - 20.0;
-    let bar_count = 64;
-    let angle_step = std::f32::consts::TAU / bar_count as f32;
-    
-    for i in 0..bar_count {
-        let idx = (i as f32 / bar_count as f32 * spectrum.len() as f32) as usize;
-        let mag = spectrum.get(idx).copied().unwrap_or(0.0);
-        let adjusted = (mag * 80.0).powf(0.75).min(1.0);
-        
-        let angle = i as f32 * angle_step + rotation;
-        let inner_r = radius * 0.3;
-        let outer_r = inner_r + adjusted * radius * 0.7;
-        
-        let start = Pos2::new(
-            center.x + angle.cos() * inner_r,
-            center.y + angle.sin() * inner_r,
-        );
-        let end = Pos2::new(
-            center.x + angle.cos() * outer_r,
-            center.y + angle.sin() * outer_r,
-        );
-        
-        let color = if i < bar_count / 3 { styles::FREQ_LOW }
-                    else if i < 2 * bar_count / 3 { styles::FREQ_MID }
-                    else { styles::FREQ_HIGH };
-        
-        painter.line_segment([start, end], Stroke::new(2.5, color));
-    }
-    
-    // Inner glow circle
-    painter.circle_stroke(center, radius * 0.28, Stroke::new(1.0, styles::RADIAL_BASE));
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        "RADIAL SPECTRUM",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
-}
 
-// =============================================================================
-// 3. STEREO CORRELATION / PHASE METER (Goniometer)
-// =============================================================================
-fn draw_phase_meter(painter: egui::Painter, rect: Rect, samples: &[f32], playhead: usize) {
-    painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
     let center = rect.center();
-    let size = (rect.width().min(rect.height()) / 2.0) - 15.0;
-    
-    // Draw crosshair guides
-    painter.line_segment(
-        [Pos2::new(center.x - size, center.y), Pos2::new(center.x + size, center.y)],
-        Stroke::new(0.5, styles::TEXT_SECONDARY),
-    );
-    painter.line_segment(
-        [Pos2::new(center.x, center.y - size), Pos2::new(center.x, center.y + size)],
-        Stroke::new(0.5, styles::TEXT_SECONDARY),
-    );
-    
-    // Plot L vs R (using consecutive samples as pseudo-stereo for mono sources)
-    let window = 512;
-    let start = playhead.min(samples.len().saturating_sub(window));
-    let chunk = &samples[start..start + window.min(samples.len() - start)];
-    
-    let mut points: Vec<Pos2> = Vec::with_capacity(chunk.len() / 2);
-    for pair in chunk.chunks_exact(2) {
-        let l = pair[0];
-        let r = pair[1];
-        let x = center.x + l * size;
-        let y = center.y - r * size; // Invert Y for standard goniometer orientation
-        points.push(Pos2::new(x, y));
+    let size = (rect.width().min(rect.height()) / 2.0) - 10.0;
+
+    painter.line_segment([Pos2::new(center.x - size, center.y), Pos2::new(center.x + size, center.y)], Stroke::new(0.5, styles::TEXT_SECONDARY));
+    painter.line_segment([Pos2::new(center.x, center.y - size), Pos2::new(center.x, center.y + size)], Stroke::new(0.5, styles::TEXT_SECONDARY));
+
+    let len = left.len().min(right.len()).min(1024);
+    let mut points: Vec<Pos2> = Vec::with_capacity(len);
+    for i in 0..len {
+        let x = center.x + left[i] * size;
+        let y = center.y - right[i] * size;
+        points.push(Pos2::new(x.clamp(rect.left(), rect.right()), y.clamp(rect.top(), rect.bottom())));
     }
-    
+
     if points.len() > 1 {
-        // Draw as scattered dots via small line segments for density
         for pts in points.windows(2) {
             painter.line_segment([pts[0], pts[1]], Stroke::new(1.0, styles::PHASE_POSITIVE));
         }
     }
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        "PHASE",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
+
+    painter.text(rect.left_top() + egui::vec2(10.0, 6.0), egui::Align2::LEFT_TOP, "STEREO PHASE", egui::FontId::proportional(9.0), styles::TEXT_SECONDARY);
 }
 
 // =============================================================================
-// 4. RMS / LUFS LOUDNESS METER
+// RMS LOUDNESS METER
 // =============================================================================
 fn draw_rms_meter(painter: egui::Painter, rect: Rect, rms_db: f32, peak_db: f32) {
     painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
-    let margin = 15.0;
+
+    let margin = 12.0;
     let bar_left = rect.left() + margin;
     let bar_right = rect.right() - margin;
-    let bar_top = rect.top() + 25.0;
-    let bar_bottom = rect.bottom() - 10.0;
+    let bar_top = rect.top() + 22.0;
+    let bar_bottom = rect.bottom() - 8.0;
     let bar_height = bar_bottom - bar_top;
-    
-    // dB range: -60 to 0
     let min_db = -60.0_f32;
     let max_db = 0.0_f32;
-    
+
     let rms_frac = ((rms_db - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
     let peak_frac = ((peak_db - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
-    
-    // Background track
-    let track_rect = Rect::from_min_max(
-        Pos2::new(bar_left, bar_top),
-        Pos2::new(bar_right, bar_bottom),
-    );
+
+    let track_rect = Rect::from_min_max(Pos2::new(bar_left, bar_top), Pos2::new(bar_right, bar_bottom));
     painter.rect_filled(track_rect, Rounding::same(4.0), Color32::from_gray(20));
-    
-    // RMS fill bar (horizontal)
-    let fill_width = rms_frac * track_rect.width();
-    let fill_rect = Rect::from_min_size(
-        Pos2::new(bar_left, bar_top),
-        egui::vec2(fill_width, bar_height),
-    );
-    painter.rect_filled(fill_rect, Rounding::same(4.0), styles::RMS_BAR);
-    
-    // Peak hold marker (vertical line)
+
+    let fill_w = rms_frac * track_rect.width();
+    painter.rect_filled(Rect::from_min_size(Pos2::new(bar_left, bar_top), egui::vec2(fill_w, bar_height)), Rounding::same(4.0), styles::RMS_BAR);
+
     let peak_x = bar_left + peak_frac * track_rect.width();
-    painter.line_segment(
-        [Pos2::new(peak_x, bar_top - 2.0), Pos2::new(peak_x, bar_bottom + 2.0)],
-        Stroke::new(2.0, styles::PEAK_HOLD),
-    );
-    
-    // dB labels
-    painter.text(
-        Pos2::new(bar_left, bar_bottom + 2.0),
-        egui::Align2::LEFT_BOTTOM,
-        "-60dB",
-        egui::FontId::proportional(8.0),
-        styles::TEXT_SECONDARY,
-    );
-    painter.text(
-        Pos2::new(bar_right, bar_bottom + 2.0),
-        egui::Align2::RIGHT_BOTTOM,
-        "0dB",
-        egui::FontId::proportional(8.0),
-        styles::TEXT_SECONDARY,
-    );
-    
-    // Current value readout
-    painter.text(
-        rect.right_top() + egui::vec2(-10.0, 8.0),
-        egui::Align2::RIGHT_TOP,
-        &format!("{:.1} dB", rms_db),
-        egui::FontId::monospace(10.0),
-        styles::TEXT_PRIMARY,
-    );
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        "RMS LOUDNESS",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
+    painter.line_segment([Pos2::new(peak_x, bar_top - 2.0), Pos2::new(peak_x, bar_bottom + 2.0)], Stroke::new(2.0, styles::PEAK_HOLD));
+
+    painter.text(rect.left_top() + egui::vec2(10.0, 4.0), egui::Align2::LEFT_TOP, "RMS LOUDNESS", egui::FontId::proportional(9.0), styles::TEXT_SECONDARY);
+    painter.text(rect.right_top() + egui::vec2(-10.0, 4.0), egui::Align2::RIGHT_TOP, &format!("{:.1} dB", rms_db), egui::FontId::monospace(10.0), styles::TEXT_PRIMARY);
 }
 
 // =============================================================================
-// 5. OSCILLOSCOPE WITH PERSISTENCE
+// WAVEFORM TIMELINE (Min/Max envelope)
 // =============================================================================
-fn draw_persistence_oscilloscope(painter: egui::Painter, rect: Rect, buffer: &[Vec<Pos2>]) {
+fn draw_waveform_timeline(painter: egui::Painter, rect: Rect, envelope: &[(f32, f32)], playhead: usize, total_frames: usize) {
     painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
-    if buffer.is_empty() { return; }
-    
+    if envelope.is_empty() || total_frames == 0 { return; }
+
+    let mid_y = rect.center().y;
     let width = rect.width() - 20.0;
     let start_x = rect.left() + 10.0;
-    let mid_y = rect.center().y;
-    
-    // Draw older frames first with increasing opacity
-    let total = buffer.len();
-    for (frame_idx, points) in buffer.iter().enumerate() {
-        let age = frame_idx as f32 / total as f32; // 0 = oldest, 1 = newest
-        let alpha = (age * 200.0 + 30.0) as u8;
-        let color = Color32::from_rgba_premultiplied(99, 179, 237, alpha);
-        let stroke_width = 1.0 + age * 1.5;
-        
-        // Scale points to fit rect
-        let scaled: Vec<Pos2> = points.iter().map(|p| {
-            let x = start_x + (p.x / 512.0) * width; // Assuming 512 downsampled points
-            let y = mid_y + p.y * (rect.height() / 120.0);
-            Pos2::new(x.clamp(rect.left(), rect.right()), y.clamp(rect.top(), rect.bottom()))
-        }).collect();
-        
-        if scaled.len() > 1 {
-            painter.add(PathShape::line(scaled, Stroke::new(stroke_width, color)));
+    let half_h = rect.height() / 2.0 - 8.0;
+
+    let mut mesh = Mesh::default();
+    let step = width / envelope.len() as f32;
+    for (i, &(min_s, max_s)) in envelope.iter().enumerate() {
+        let x = start_x + i as f32 * step;
+        let y_min = mid_y - min_s * half_h;
+        let y_max = mid_y - max_s * half_h;
+        mesh.colored_vertex(Pos2::new(x, y_max), styles::WAVE_FILL);
+        mesh.colored_vertex(Pos2::new(x, y_min), styles::WAVE_FILL);
+        if i > 0 {
+            let idx = mesh.vertices.len() as u32 - 2;
+            mesh.add_triangle(idx - 2, idx - 1, idx);
+            mesh.add_triangle(idx - 1, idx + 1, idx);
         }
     }
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        "OSCILLOSCOPE (PERSISTENCE)",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
-}
+    painter.add(mesh);
 
-// =============================================================================
-// MINI PANELS (Bottom-right quadrant)
-// =============================================================================
-fn draw_waveform_mini(painter: egui::Painter, rect: Rect, samples: &[f32], playhead: usize) {
-    painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
-    let mid_y = rect.center().y;
-    let width = rect.width() - 20.0;
-    let start_x = rect.left() + 10.0;
-    
-    let window_size = 1024;
-    let start = playhead.min(samples.len().saturating_sub(window_size));
-    let end = (start + window_size).min(samples.len());
-    let window = &samples[start..end];
-    
-    if !window.is_empty() {
-        let step = width / window.len() as f32;
-        let points: Vec<Pos2> = window.iter().enumerate()
-            .map(|(i, &s)| Pos2::new(start_x + i as f32 * step, mid_y - s * (rect.height() / 3.0)))
-            .collect();
-        
-        if points.len() > 1 {
-            painter.add(PathShape::line(points, Stroke::new(1.5, styles::WAVE_COLOR)));
-        }
-    }
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 6.0),
-        egui::Align2::LEFT_TOP,
-        "TIME DOMAIN",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
-}
+    let progress = (playhead as f32 / total_frames as f32).clamp(0.0, 1.0);
+    let head_x = start_x + progress * width;
+    painter.line_segment([Pos2::new(head_x, rect.top()), Pos2::new(head_x, rect.bottom())], Stroke::new(2.0, styles::PLAYHEAD_COLOR));
 
-fn draw_spectrum_bars_mini(painter: egui::Painter, rect: Rect, spectrum: &[f32]) {
-    painter.rect_filled(rect, Rounding::same(12.0), styles::PANEL_BG);
-    
-    let bar_count = 32;
-    let usable_width = rect.width() - 20.0;
-    let bar_width = usable_width / bar_count as f32;
-    let gap = 2.0;
-    let actual_w = (bar_width - gap).max(1.5);
-    let start_x = rect.left() + 10.0;
-    let bottom_y = rect.bottom() - 8.0;
-    let max_h = rect.height() - 25.0;
-    
-    for i in 0..bar_count {
-        let idx = (i as f32 / bar_count as f32 * spectrum.len() as f32) as usize;
-        let mag = spectrum.get(idx).copied().unwrap_or(0.0);
-        let adjusted = (mag * 80.0).powf(0.75).min(1.0);
-        let h = adjusted * max_h;
-        
-        let x = start_x + i as f32 * bar_width;
-        let color = if i < bar_count / 3 { styles::FREQ_LOW }
-                    else if i < 2 * bar_count / 3 { styles::FREQ_MID }
-                    else { styles::FREQ_HIGH };
-        
-        let bar_rect = Rect::from_min_max(
-            Pos2::new(x, bottom_y - h),
-            Pos2::new(x + actual_w, bottom_y),
-        );
-        painter.rect_filled(bar_rect, Rounding::same(2.0), color);
-    }
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 6.0),
-        egui::Align2::LEFT_TOP,
-        "FREQUENCY",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
-}
-
-// =============================================================================
-// EXISTING: Track Overview (unchanged from previous version)
-// =============================================================================
-fn draw_track_overview(ui: &mut egui::Ui, samples: &[f32], playhead: usize, total_samples: usize, height: f32) {
-    let panel_rect = ui.available_rect_before_wrap();
-    let rect = Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), height));
-    
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, Rounding::same(8.0), styles::PANEL_BG);
-    
-    if total_samples == 0 { return; }
-    
-    let width = rect.width() - 20.0;
-    let start_x = rect.left() + 10.0;
-    let mid_y = rect.center().y;
-    let step = (total_samples as f32 / width).max(1.0);
-    let num_points = (width / 2.0) as usize;
-    
-    let mut points: Vec<Pos2> = Vec::with_capacity(num_points);
-    for i in 0..num_points {
-        let sample_idx = ((i as f32 * step) as usize).min(total_samples - 1);
-        let s = samples[sample_idx];
-        let x = start_x + (i as f32 * 2.0);
-        let y = mid_y - s * (height / 3.0);
-        points.push(Pos2::new(x, y));
-    }
-    
-    if points.len() > 1 {
-        painter.add(PathShape::line(points, Stroke::new(1.0, styles::OVERVIEW_WAVE)));
-    }
-    
-    let progress = playhead as f32 / total_samples as f32;
-    let head_x = start_x + (progress * width);
-    painter.line_segment(
-        [Pos2::new(head_x, rect.top()), Pos2::new(head_x, rect.bottom())],
-        Stroke::new(2.0, styles::PLAYHEAD_COLOR),
-    );
-    
-    painter.text(
-        rect.left_top() + egui::vec2(10.0, 5.0),
-        egui::Align2::LEFT_TOP,
-        "TRACK OVERVIEW",
-        egui::FontId::proportional(9.0),
-        styles::TEXT_SECONDARY,
-    );
-    
-    ui.allocate_rect(rect, egui::Sense::hover());
+    painter.text(rect.left_top() + egui::vec2(10.0, 6.0), egui::Align2::LEFT_TOP, "WAVEFORM", egui::FontId::proportional(9.0), styles::TEXT_SECONDARY);
 }
 ```
 

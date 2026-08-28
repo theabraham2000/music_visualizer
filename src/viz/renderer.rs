@@ -126,8 +126,8 @@ fn draw_radial_hero(painter: egui::Painter, rect: Rect, spectrum: &[f32], rotati
     painter.text(
         center,
         egui::Align2::CENTER_CENTER,
-        "MINSU\nAUDIO",
-        egui::FontId::proportional(14.0),
+        "MinSu Lab",
+        egui::FontId::proportional(12.0),
         styles::TEXT_PRIMARY,
     );
 
