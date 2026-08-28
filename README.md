@@ -1,7 +1,10 @@
 # music_visualizer
-Visualize the Music
 
-to run the code:
+## Visualize the Music
 
+To Run:
+
+```
 cargo build
 cargo run
+```
