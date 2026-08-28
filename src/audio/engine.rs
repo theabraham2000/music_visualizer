@@ -2,7 +2,7 @@ use rodio::{Decoder, Sink, OutputStream};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct AudioEngine {
     _stream: Option<OutputStream>,
@@ -55,7 +55,6 @@ impl AudioEngine {
                 if let Some(sink) = &self.sink {
                     sink.pause();
                 }
-                // Freeze position
                 if let Some(started) = self.started_at {
                     self.paused_position_secs += started.elapsed().as_secs_f32();
                 }
@@ -86,7 +85,19 @@ impl AudioEngine {
         self.paused_position_secs = 0.0;
     }
 
-    /// Returns the current playback position in seconds, derived from real elapsed time.
+    /// Seek to a specific position in seconds.
+    pub fn seek_to(&mut self, position_secs: f32) {
+        let clamped = position_secs.clamp(0.0, self.duration_secs);
+        if let Some(sink) = &self.sink {
+            let _ = sink.try_seek(Duration::from_secs_f32(clamped));
+        }
+        // Reset timing reference so position_seconds() stays accurate
+        self.paused_position_secs = clamped;
+        if self.is_playing {
+            self.started_at = Some(Instant::now());
+        }
+    }
+
     pub fn position_seconds(&self) -> f32 {
         let elapsed = match (self.is_playing, self.started_at) {
             (true, Some(started)) => self.paused_position_secs + started.elapsed().as_secs_f32(),
@@ -95,7 +106,6 @@ impl AudioEngine {
         elapsed.min(self.duration_secs)
     }
 
-    /// Returns the current playback position in samples (per-channel).
     pub fn position_samples(&self, sample_rate: u32) -> usize {
         (self.position_seconds() * sample_rate as f32) as usize
     }
@@ -108,7 +118,6 @@ impl AudioEngine {
         if self.is_playing {
             if let Some(sink) = &self.sink {
                 if sink.empty() {
-                    // Freeze at end position
                     if let Some(started) = self.started_at {
                         self.paused_position_secs += started.elapsed().as_secs_f32();
                     }

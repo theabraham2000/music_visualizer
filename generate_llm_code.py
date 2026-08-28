@@ -30,6 +30,7 @@ IGNORE_FILES = {
     ".gitignore",
     "generate_llm_code.py",
     "README.md",
+    "milestones.md",
 }
 
 # File extensions that should be treated as code.
@@ -76,6 +77,7 @@ CODE_EXTENSIONS = {
     ".ex",
     ".exs",
     ".md",
+    ".toml",
 }
 
 # Output file
