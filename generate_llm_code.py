@@ -29,6 +29,7 @@ IGNORE_FILES = {
     "llm_code.md",
     ".gitignore",
     "generate_llm_code.py",
+    "README.md",
 }
 
 # File extensions that should be treated as code.
@@ -74,6 +75,7 @@ CODE_EXTENSIONS = {
     ".pl",
     ".ex",
     ".exs",
+    ".md",
 }
 
 # Output file
