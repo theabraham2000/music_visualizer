@@ -7,6 +7,7 @@ This document contains the project structure and the source code of the reposito
 ```text
 music_visualizer
 ├── AGENTS.md
+├── Cargo.toml
 └── src
     ├── app.rs
     ├── main.rs
@@ -37,6 +38,22 @@ music_visualizer
 - Never add emojis in the codebase.
 - Keep the codebase clean and readable.
 - Use Rust Programming language only.
+```
+
+## `Cargo.toml`
+
+```
+[package]
+name = "music_visualizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+rodio = { version = "0.20", features = ["mp3"] }
+rustfft = "6.2"
+num-complex = "0.4"
+rfd = "0.14"
 ```
 
 ## `src/app.rs`
@@ -819,7 +836,7 @@ pub mod styles;
 
 ```rust
 use eframe::egui::{self, Pos2, Rect, Stroke, Color32, Rounding, Sense};
-use eframe::epaint::{Mesh, PathShape, PathStroke};
+use eframe::epaint::{Mesh, PathShape};
 use super::styles;
 use std::sync::LazyLock;
 
@@ -1037,8 +1054,8 @@ fn draw_radial_hero(
             // Four corners of the bar quad
             let hw = bar_half_width;
             let p1 = Pos2::new(sx + perp_x * hw, sy + perp_y * hw);
-            let p2 = Pos2::new(ex + perp_x * hw, ey + perp_y * hw);
-            let p3 = Pos2::new(ex - perp_x * hw, ey - perp_y * hw);
+            let _p2 = Pos2::new(ex + perp_x * hw, ey + perp_y * hw);
+            let _p3 = Pos2::new(ex - perp_x * hw, ey - perp_y * hw);
             let p4 = Pos2::new(sx - perp_x * hw, sy - perp_y * hw);
 
             // Rounded tip: add arc points at the outer end

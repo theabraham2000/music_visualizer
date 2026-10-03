@@ -320,5 +320,6 @@ def main():
     print(f"Included {len(code_files)} code files.")
 
 
+# uv run -m generate_llm_code
 if __name__ == "__main__":
     main()
